@@ -1,0 +1,237 @@
+#!/bin/bash
+# /usr/local/bin/gfblk-daemon
+
+PERSIST_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gfblk"
+RUNTIME_STATE="/tmp/gfblk_state"
+LOG_FILE="/tmp/gfblk.log"
+
+# 状态定义
+STATE_NORMAL="normal"
+STATE_OFF="screen_off"
+STATE_WAKEUP="wakeup"
+
+# 检查核心依赖
+check_core_deps() {
+    local missing=()
+    command -v xprintidle >/dev/null || missing+=("xprintidle")
+    command -v xset >/dev/null       || missing+=("x11-xserver-utils (provides xset)")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "错误: 缺少必需的依赖包: ${missing[*]}" >&2
+        echo "请运行以下命令安装:" >&2
+        echo "  sudo apt install -y xprintidle x11-xserver-utils" >&2
+        return 1
+    fi
+    return 0
+}
+
+mkdir -p "$PERSIST_DIR"
+mkdir -p /tmp
+
+# 日志函数
+log_event() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# 初始化日志
+init_log() {
+    echo "=== GFBLK Daemon 启动于 $(date) ===" >> "$LOG_FILE"
+    log_event "守护进程初始化"
+}
+
+# 加载配置
+load_config() {
+    enabled=$(cat "$PERSIST_DIR/enabled" 2>/dev/null || echo "false")
+    timeout_raw=$(cat "$PERSIST_DIR/timeout" 2>/dev/null || echo "300")
+    unit=$(cat "$PERSIST_DIR/unit" 2>/dev/null || echo "sec")
+    
+    # 转换为秒
+    case "$unit" in
+        min) timeout_sec=$((timeout_raw * 60)) ;;
+        h) timeout_sec=$((timeout_raw * 3600)) ;;
+        *) timeout_sec=$timeout_raw ;;
+    esac
+    timeout_ms=$((timeout_sec * 1000))
+}
+
+# 获取屏幕状态
+get_screen_status() {
+    if xset q 2>/dev/null | grep -q "Monitor is Off"; then
+        echo "off"
+    else
+        echo "on"
+    fi
+}
+
+# 获取空闲时间
+get_idle_time() {
+    xprintidle 2>/dev/null || echo 0
+}
+
+# 写入运行时状态
+write_runtime_state() {
+    local current_state="$1"
+    local idle_ms="$2"
+    local screen_status="$3"
+    local current_time=$(date +%s)
+    local last_activity=$((current_time - (idle_ms / 1000)))
+    
+    # 从持久化配置读取基础配置
+    local enabled=$(cat "$PERSIST_DIR/enabled" 2>/dev/null || echo "false")
+    local timeout_raw=$(cat "$PERSIST_DIR/timeout" 2>/dev/null || echo "300")
+    local unit=$(cat "$PERSIST_DIR/unit" 2>/dev/null || echo "sec")
+    
+    cat > "$RUNTIME_STATE" <<EOF
+enabled=$enabled
+timeout=$timeout_raw
+unit=$unit
+last_activity=$last_activity
+idle_ms=$idle_ms
+state=$current_state
+screen_status=$screen_status
+EOF
+}
+
+# 改进的状态机 - 修复关键问题
+improved_state_machine() {
+    local current_time=$(date +%s)
+    local last_activity=$(grep '^last_activity=' "$RUNTIME_STATE" 2>/dev/null | cut -d= -f2)
+    local idle_sec=$((current_time - last_activity))
+    local idle_ms=$((idle_sec * 1000))
+    local screen_status=$(get_screen_status)
+    
+    local current_state="$STATE_NORMAL"
+    if [ -f "$RUNTIME_STATE" ]; then
+        current_state=$(grep '^state=' "$RUNTIME_STATE" 2>/dev/null | cut -d= -f2 | head -1)
+        [ -z "$current_state" ] && current_state="$STATE_NORMAL"
+    fi
+    
+    # 如果功能禁用，确保屏幕开启并重置状态
+    if [ "$enabled" != "true" ]; then
+        if [ "$screen_status" = "off" ]; then
+            xset dpms force on 2>/dev/null
+            log_event "功能禁用 - 点亮屏幕"
+        fi
+        if [ "$current_state" != "$STATE_NORMAL" ]; then
+            current_state="$STATE_NORMAL"
+            log_event "状态重置: 功能禁用 -> 正常状态"
+        fi
+        write_runtime_state "$current_state" "$idle_ms" "$screen_status"
+        return
+    fi
+    
+    # 功能启用时的状态处理
+    case "$current_state" in
+        "$STATE_NORMAL")
+            # 正常状态：监控空闲时间
+            if [ "$idle_sec" -ge "$timeout_sec" ] && [ "$screen_status" = "on" ]; then
+                # 进入息屏状态
+                xset dpms force off 2>/dev/null
+                current_state="$STATE_OFF"
+                # 在息屏状态下，空闲时间应该保持在超时值
+                idle_ms=$timeout_ms
+                idle_sec=$timeout_sec
+                screen_status="off"
+                log_event "状态转换: 正常 -> 息屏 (空闲${idle_sec}秒)"
+            fi
+            ;;
+            
+        "$STATE_OFF")
+            # 息屏状态：保持空闲时间不变，只检测唤醒事件
+            # 保持空闲时间为超时值
+            idle_ms=$timeout_ms
+            idle_sec=$timeout_sec
+            
+            # 检测唤醒条件
+            local actual_idle_ms=$(get_idle_time)
+            local actual_idle_sec=$((actual_idle_ms / 1000))
+            local actual_screen_status=$(get_screen_status)
+            
+            # 如果实际空闲时间小于超时时间（用户活动）或屏幕被点亮
+            if [ "$actual_idle_sec" -lt "$timeout_sec" ] || [ "$actual_screen_status" = "on" ]; then
+                current_state="$STATE_WAKEUP"
+                log_event "状态转换: 息屏 -> 唤醒 (检测到活动或屏幕点亮)"
+            else
+                # 保持息屏状态，确保屏幕关闭
+                if [ "$actual_screen_status" = "on" ]; then
+                    xset dpms force off 2>/dev/null
+                fi
+                screen_status="off"
+            fi
+            ;;
+            
+        "$STATE_WAKEUP")
+            # 唤醒处理状态
+            if [ "$screen_status" = "off" ]; then
+                xset dpms force on 2>/dev/null
+                log_event "屏幕控制: 点亮屏幕"
+                screen_status="on"
+            fi
+            
+            # 重置空闲时间计数
+            local reset_time=$(date +%s)
+            idle_ms=0
+            idle_sec=0
+            
+            # 检测是否为触摸唤醒（快速活动）
+            local actual_idle_ms=$(get_idle_time)
+            local actual_idle_sec=$((actual_idle_ms / 1000))
+            if [ "$actual_idle_sec" -lt 2 ]; then
+                log_event "触摸唤醒检测 - 快速活动"
+            fi
+            
+            # 返回正常状态
+            current_state="$STATE_NORMAL"
+            log_event "状态转换: 唤醒 -> 正常"
+            ;;
+    esac
+    
+    # 更新运行时状态
+    write_runtime_state "$current_state" "$idle_ms" "$screen_status"
+}
+
+# 清理函数
+cleanup() {
+    log_event "守护进程退出 - 清理资源"
+    xset dpms force on 2>/dev/null
+    rm -f "/tmp/gfblk_touch_eater"
+    exit 0
+}
+
+# 设置退出陷阱
+trap cleanup TERM INT EXIT
+
+# 主循环
+main_loop() {
+    check_core_deps
+    init_log
+    log_event "守护进程启动"
+    
+    load_config
+
+    # 初始状态重置
+    local current_time=$(date +%s)
+    cat > "$RUNTIME_STATE" <<EOF
+enabled=$enabled
+timeout=$timeout_raw
+unit=$unit
+last_activity=$current_time
+idle_ms=0
+state=$STATE_NORMAL
+screen_status=$(get_screen_status)
+EOF
+    
+    local loop_count=0
+    while true; do
+        # 每5次循环重新加载配置
+        if [ $((loop_count %5)) -eq 0 ]; then
+            load_config
+        fi
+        ((loop_count++))
+        
+        improved_state_machine
+        sleep 1
+    done
+}
+
+main_loop

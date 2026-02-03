@@ -1,0 +1,243 @@
+#!/bin/bash
+# 高分生物息屏功能控制
+
+PERSIST_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gfblk"
+RUNTIME_STATE="/tmp/gfblk_state"
+SERVICE_NAME="gfblk.service"
+
+export DISPLAY=:0
+
+mkdir -p "$PERSIST_DIR"
+
+show_help() {
+    echo "======================HSCORE-SCREEN-CONROLE======================"
+    echo "Usage:"
+    echo "  gfblkctl on                启用息屏功能"
+    echo "  gfblkctl off               禁用息屏功能"
+    echo "  gfblkctl -t <num>          设置超时数值（正整数，默认单位不变）"
+    echo "  gfblkctl -m sec|min|h      设置时间单位（数值不变）"
+    echo "  gfblkctl -s|--status       查看当前状态"
+    echo "  gfblkctl -h|--help         显示此帮助"
+    echo
+    echo "说明：-t 和 -m 可单独使用，也可组合使用。"
+    echo "示例:"
+    echo "  gfblkctl -t 30             # 30 秒（若当前单位是 sec）"
+    echo "  gfblkctl -m min            # 单位改为分钟，数值不变"
+    echo "  gfblkctl -t 5 -m min       # 设置为 5 分钟"
+    echo "  gfblkctl --status          # 查看当前配置"
+    echo "======================HSCORE-SCREEN-CONROLE======================"
+}
+
+# 检查核心依赖
+check_core_deps() {
+    local missing=()
+    command -v xprintidle >/dev/null || missing+=("xprintidle")
+    command -v xset >/dev/null       || missing+=("x11-xserver-utils (provides xset)")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "错误: 缺少必需的依赖包: ${missing[*]}" >&2
+        echo "请运行以下命令安装:" >&2
+        echo "  sudo apt install -y xprintidle x11-xserver-utils" >&2
+        exit 1
+    fi
+    return 0
+}
+check_core_deps
+
+# 从持久化加载当前配置
+load_persist_config() {
+    enabled=$(cat "$PERSIST_DIR/enabled" 2>/dev/null || echo "false")
+    timeout=$(cat "$PERSIST_DIR/timeout" 2>/dev/null || echo "300")
+    unit=$(cat "$PERSIST_DIR/unit" 2>/dev/null || echo "sec")
+}
+
+# 保存配置到持久化 + 运行时
+save_config() {
+    local _enabled="$1" _timeout="$2" _unit="$3"
+    
+    echo "$_enabled" > "$PERSIST_DIR/enabled"
+    echo "$_timeout" > "$PERSIST_DIR/timeout"
+    echo "$_unit" > "$PERSIST_DIR/unit"
+
+}
+
+# 重启守护进程
+restart_daemon() {
+    if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user restart "$SERVICE_NAME"
+    else
+        systemctl --user start "$SERVICE_NAME"
+    fi
+}
+
+# 获取实际空闲时间（毫秒）
+get_idle_time() {
+    if command -v xprintidle >/dev/null 2>&1; then
+        xprintidle 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
+# 获取实际屏幕状态
+get_actual_screen_status() {
+    if xset q 2>/dev/null | grep -q "Monitor is Off"; then
+        echo "已关闭"
+    else
+        echo "正常开启"
+    fi
+}
+
+# 采用系统空闲计时器的方案比较傻瓜，因为从串口终端修改状态并不会重置空闲时间，所以该方案不太好用。
+# reset_idle_timer() {
+#     # 安全地重置空闲计时器
+#     if command -v xdotool >/dev/null 2>&1; then
+#         if MOUSE_INFO=$(xdotool getmouselocation 2>/dev/null); then
+#             X=$(echo "$MOUSE_INFO" | grep -oP 'x:\K\d+')
+#             Y=$(echo "$MOUSE_INFO" | grep -oP 'y:\K\d+')
+#             if [[ -n "$X" && -n "$Y" ]]; then
+#                 xdotool mousemove_relative -- 1 0 2>/dev/null
+#                 sleep 0.01
+#                 xdotool mousemove --sync "$X" "$Y" 2>/dev/null
+#             else
+#                 xdotool mousemove_relative -- 1 0 2>/dev/null
+#                 xdotool mousemove_relative -- -1 0 2>/dev/null
+#             fi
+#         else
+#             echo "警告: 无法获取鼠标位置" >&2
+#         fi
+#     else
+#         echo "警告: 未安装 xdotool，无法重置空闲时间（建议安装）" >&2
+#         echo "请运行: sudo apt install xdotool" >&2
+#     fi
+# }
+
+# ==================== 参数解析 ====================
+
+# 先加载当前持久化配置
+load_persist_config
+
+UNIT_SET=""
+TIMEOUT_SET=""
+SHOW_STATUS=false
+ACTION=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        on)
+            ACTION="on"; shift ;;
+        off)
+            ACTION="off"; shift ;;
+        -t|--time)
+            TIMEOUT_SET="$2"; shift 2 ;;
+        -m|--unit)
+            UNIT_SET="$2"; shift 2 ;;
+        -s|--status)
+            SHOW_STATUS=true; shift ;;
+        -h|--help)
+            show_help; exit 0 ;;
+        *)
+            echo "未知参数: $1" >&2; show_help >&2; exit 1 ;;
+    esac
+done
+
+# 处理状态查看
+if [ "$SHOW_STATUS" = true ]; then
+    # 从持久化文件读取配置
+    enabled=$(cat "$PERSIST_DIR/enabled" 2>/dev/null || echo "false")
+    timeout=$(cat "$PERSIST_DIR/timeout" 2>/dev/null || echo "300")
+    unit=$(cat "$PERSIST_DIR/unit" 2>/dev/null || echo "sec")
+
+    # 计算秒数
+    timeout_sec=$timeout
+    case "$unit" in
+        min) timeout_sec=$((timeout * 60)) ;;
+        h) timeout_sec=$((timeout * 3600)) ;;
+    esac
+
+    # 读取运行时状态
+    if [ -f "$RUNTIME_STATE" ]; then
+        state=$(grep '^state=' "$RUNTIME_STATE" | cut -d= -f2)
+        idle_ms=$(grep '^idle_ms=' "$RUNTIME_STATE" | cut -d= -f2)
+    else
+        state="unknown"
+        idle_ms=0
+    fi
+
+    # 状态描述映射
+    case "$state" in
+        "normal") state_desc="正常状态" ;;
+        "screen_off") state_desc="息屏状态" ;;
+        "wakeup") state_desc="唤醒处理" ;;
+        *) state_desc="未知状态" ;;
+    esac
+
+    # 获取实际空闲时间（更准确）
+    idle_sec=$((idle_ms / 1000))
+
+    # 获取实际屏幕状态
+    actual_screen_status=$(get_actual_screen_status)
+
+    echo "当前状态："
+    echo "  功能启用: $enabled"
+    echo "  状态机: $state_desc"
+    echo "  超时设置: ${timeout}${unit} (${timeout_sec}秒)"
+    echo "  当前空闲: ${idle_sec}秒"
+    echo "  屏幕状态: $actual_screen_status"
+    
+    if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        echo "  服务状态: 运行中"
+    else
+        echo "  服务状态: 未运行"
+    fi
+    exit 0
+fi
+
+# 处理 on/off
+if [ "$ACTION" = "on" ]; then
+    save_config "true" "$timeout" "$unit"
+    systemctl --user enable "$SERVICE_NAME" 2>/dev/null
+
+    # reset_idle_timer
+
+    restart_daemon
+    echo "息屏功能已启用（开机自启已开启）"
+    exit 0
+    
+elif [ "$ACTION" = "off" ]; then
+    save_config "false" "$timeout" "$unit"
+    systemctl --user stop "$SERVICE_NAME" 2>/dev/null      # 停止进程
+    systemctl --user disable "$SERVICE_NAME" 2>/dev/null   # 禁用自启
+    xset dpms force on 2>/dev/null
+    echo "息屏功能已禁用（开机自启已关闭）"
+    exit 0
+fi
+
+
+# 处理 -t / -m
+if [ -z "$TIMEOUT_SET" ] && [ -z "$UNIT_SET" ]; then
+    echo "未指定操作。使用 -h 查看帮助。" >&2
+    exit 1
+fi
+
+# 验证 timeout
+if [ -n "$TIMEOUT_SET" ]; then
+    if ! [[ "$TIMEOUT_SET" =~ ^[0-9]+$ ]] || [ "$TIMEOUT_SET" -eq 0 ]; then
+        echo "错误：超时值必须是正整数" >&2
+        exit 1
+    fi
+    timeout="$TIMEOUT_SET"
+fi
+
+# 验证 unit
+if [ -n "$UNIT_SET" ]; then
+    case "$UNIT_SET" in
+        sec|min|h) unit="$UNIT_SET" ;;
+        *) echo "错误：单位必须是 sec、min 或 h" >&2; exit 1 ;;
+    esac
+fi
+
+# 保存并启用
+save_config "true" "$timeout" "$unit"
+restart_daemon
+echo "配置已更新：超时${timeout}${unit}"
