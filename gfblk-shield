@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+# /usr/local/bin/gfblk-shield (Pure Event-Driven Version)
+import sys, time
+from Xlib import X, display
+
+def main():
+    try:
+        dsp = display.Display()
+        root = dsp.screen().root
+        w, h = root.get_geometry().width, root.get_geometry().height
+        
+        # 创建全屏透明窗口
+        win = root.create_window(0, 0, w, h, 0,
+            X.CopyFromParent, X.InputOutput, X.CopyFromParent,
+            override_redirect=1,
+            event_mask=X.ButtonPressMask | X.PointerMotionMask | X.KeyPressMask)
+        
+        win.map()
+        win.configure(stack_mode=X.Above)
+        dsp.sync()
+        
+        # 【核心】无限循环等待，直到捕获到第一个事件
+        # 没有超时，没有 sleep 限制，纯粹的事件驱动
+        while True:
+            if dsp.pending_events() > 0:
+                dsp.next_event() # 吃掉这第一个事件
+                break
+            time.sleep(0.05) # 短暂休眠降低 CPU 占用
+            
+        # 事件捕获到了，任务完成
+        win.unmap()
+        win.destroy()
+        dsp.sync()
+        
+    except Exception:
+        # 发生任何错误（如 Display 断开），直接退出
+        # 主进程的看门狗会负责重启我们
+        pass
+
+if __name__ == "__main__":
+    main()

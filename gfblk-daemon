@@ -16,6 +16,18 @@ check_core_deps() {
     command -v xprintidle >/dev/null || missing+=("xprintidle")
     command -v xset >/dev/null       || missing+=("x11-xserver-utils (provides xset)")
 
+    # 检查盾牌脚本
+    if [ ! -x "/usr/local/bin/gfblk-shield" ]; then
+        echo "警告: 未找到可执行的 /usr/local/bin/gfblk-shield，防误触功能将失效。" >&2
+    fi
+
+    # 检查 Python 环境 (盾牌依赖)
+    if ! command -v python3 >/dev/null; then
+        missing+=("python3")
+    elif ! python3 -c "from Xlib import display" 2>/dev/null; then
+        missing+=("python3-xlib")
+    fi
+
     if [ ${#missing[@]} -gt 0 ]; then
         echo "错误: 缺少必需的依赖包: ${missing[*]}" >&2
         echo "请运行以下命令安装:" >&2
@@ -65,7 +77,12 @@ get_screen_status() {
 
 # 获取空闲时间
 get_idle_time() {
-    xprintidle 2>/dev/null || echo 0
+    local val=$(xprintidle 2>/dev/null)
+    if [ -z "$val" ] || ! [[ "$val" =~ ^[0-9]+$ ]]; then
+        echo 0
+    else
+        echo "$val"
+    fi
 }
 
 # 写入运行时状态
@@ -73,8 +90,7 @@ write_runtime_state() {
     local current_state="$1"
     local idle_ms="$2"
     local screen_status="$3"
-    local current_time=$(date +%s)
-    local last_activity=$((current_time - (idle_ms / 1000)))
+    local last_activity="$4"
     
     # 从持久化配置读取基础配置
     local enabled=$(cat "$PERSIST_DIR/enabled" 2>/dev/null || echo "false")
@@ -95,28 +111,62 @@ EOF
 # 改进的状态机 - 修复关键问题
 improved_state_machine() {
     local current_time=$(date +%s)
-    local last_activity=$(grep '^last_activity=' "$RUNTIME_STATE" 2>/dev/null | cut -d= -f2)
-    local idle_sec=$((current_time - last_activity))
-    local idle_ms=$((idle_sec * 1000))
+
+    local actual_idle_ms=$(get_idle_time)
+    local actual_idle_sec=$((actual_idle_ms / 1000))
+
     local screen_status=$(get_screen_status)
-    
+
     local current_state="$STATE_NORMAL"
+    local recorded_last_activity=0
+
     if [ -f "$RUNTIME_STATE" ]; then
         current_state=$(grep '^state=' "$RUNTIME_STATE" 2>/dev/null | cut -d= -f2 | head -1)
+        recorded_last_activity=$(grep '^last_activity=' "$RUNTIME_STATE" 2>/dev/null | cut -d= -f2)
         [ -z "$current_state" ] && current_state="$STATE_NORMAL"
+        [ -z "$recorded_last_activity" ] && recorded_last_activity=$current_time
     fi
-    
+
+    # 检测用户活动并重置计时器
+    # 如果实际空闲时间 (actual_idle_sec) 远小于 (当前时间 - 记录的最后活动时间)
+    # 说明发生了新的输入事件（触摸/鼠标/键盘），必须更新 last_activity 为当前时间
+    local calculated_idle_from_record=$((current_time - recorded_last_activity))
+    # 允许 1 秒的误差，如果实际空闲时间比记录推算的空闲时间少 2 秒以上，视为新活动
+    if [ "$actual_idle_sec" -lt $((calculated_idle_from_record - 2)) ]; then
+        # 检测到活动！重置基准时间
+        recorded_last_activity=$current_time
+        # 如果之前处于息屏或唤醒状态，现在应该视为正常活跃状态
+        if [ "$current_state" != "$STATE_NORMAL" ]; then
+            log_event "检测到用户活动 - 重置计时器并恢复常态"
+            # 如果屏幕是关的，先打开
+            if [ "$screen_status" = "off" ]; then
+                xset dpms force on 2>/dev/null
+                screen_status="on"
+            fi
+            current_state="$STATE_NORMAL"
+        else
+            # 仅在日志中偶尔记录，避免刷屏，这里简化处理不记录每次微小活动
+            : 
+        fi
+    fi
+
+    # 重新计算基于最新基准的空闲时间
+    local effective_idle_sec=$((current_time - recorded_last_activity))
+    local effective_idle_ms=$((effective_idle_sec * 1000))
+
     # 如果功能禁用，确保屏幕开启并重置状态
     if [ "$enabled" != "true" ]; then
         if [ "$screen_status" = "off" ]; then
             xset dpms force on 2>/dev/null
             log_event "功能禁用 - 点亮屏幕"
+            screen_status="on"
         fi
         if [ "$current_state" != "$STATE_NORMAL" ]; then
             current_state="$STATE_NORMAL"
             log_event "状态重置: 功能禁用 -> 正常状态"
         fi
-        write_runtime_state "$current_state" "$idle_ms" "$screen_status"
+        recorded_last_activity=$current_time
+        write_runtime_state "$current_state" "$effective_idle_ms" "$screen_status" "$recorded_last_activity"
         return
     fi
     
@@ -124,70 +174,81 @@ improved_state_machine() {
     case "$current_state" in
         "$STATE_NORMAL")
             # 正常状态：监控空闲时间
-            if [ "$idle_sec" -ge "$timeout_sec" ] && [ "$screen_status" = "on" ]; then
+            if [ "$effective_idle_sec" -ge "$timeout_sec" ] && [ "$screen_status" = "on" ]; then
                 # 进入息屏状态
                 xset dpms force off 2>/dev/null
                 current_state="$STATE_OFF"
-                # 在息屏状态下，空闲时间应该保持在超时值
-                idle_ms=$timeout_ms
-                idle_sec=$timeout_sec
                 screen_status="off"
-                log_event "状态转换: 正常 -> 息屏 (空闲${idle_sec}秒)"
+
+                if [ -x "/usr/local/bin/gfblk-shield" ]; then
+                    # 使用 setsid 确保它独立运行，不受主进程 sleep 影响
+                    # 显式传递环境变量
+                    DISPLAY=:0 setsid /usr/local/bin/gfblk-shield &
+                    log_event "已部署潜伏盾牌 (等待首次触摸)"
+                fi
+                
+                # 注意：此时 recorded_last_activity 保持不变，以便唤醒时能计算出真正的空闲时长
+                log_event "状态转换: 正常 -> 息屏 (空闲${effective_idle_sec}秒)"
             fi
             ;;
             
         "$STATE_OFF")
-            # 息屏状态：保持空闲时间不变，只检测唤醒事件
-            # 保持空闲时间为超时值
-            idle_ms=$timeout_ms
-            idle_sec=$timeout_sec
-            
-            # 检测唤醒条件
-            local actual_idle_ms=$(get_idle_time)
-            local actual_idle_sec=$((actual_idle_ms / 1000))
-            local actual_screen_status=$(get_screen_status)
-            
-            # 如果实际空闲时间小于超时时间（用户活动）或屏幕被点亮
-            if [ "$actual_idle_sec" -lt "$timeout_sec" ] || [ "$actual_screen_status" = "on" ]; then
-                current_state="$STATE_WAKEUP"
-                log_event "状态转换: 息屏 -> 唤醒 (检测到活动或屏幕点亮)"
-            else
-                # 保持息屏状态，确保屏幕关闭
-                if [ "$actual_screen_status" = "on" ]; then
-                    xset dpms force off 2>/dev/null
+            # --- 【核心看门狗】确保盾牌持续运行 ---
+            # 如果检测到没有盾牌进程在运行，立即启动一个新的
+            if ! pgrep -f "gfblk-shield" >/dev/null; then
+                if [ -x "/usr/local/bin/gfblk-shield" ]; then
+                    DISPLAY=:0 setsid /usr/local/bin/gfblk-shield &
+                    log_event "看门狗：检测到盾牌缺失，已重新部署"
                 fi
-                screen_status="off"
             fi
-            ;;
-            
+
+            if [ "$screen_status" = "on" ] || [ "$effective_idle_sec" -lt "$timeout_sec" ]; then
+                current_state="$STATE_WAKEUP"
+                log_event "状态转换: 息屏 -> 唤醒 (检测到活动)"
+                
+                # 确保屏幕是亮的
+                if [ "$screen_status" = "off" ]; then
+                    xset dpms force on 2>/dev/null
+                    screen_status="on"
+                fi
+            else
+            # 保持息屏，防止意外点亮
+                if [ "$screen_status" = "on" ]; then
+                    xset dpms force off 2>/dev/null
+                    screen_status="off"
+                fi
+            fi
+            ;;            
+        # "$STATE_WAKEUP")
+        #     # 唤醒处理状态
+        #     if [ "$screen_status" = "off" ]; then
+        #         xset dpms force on 2>/dev/null
+        #         log_event "屏幕控制: 点亮屏幕"
+        #         screen_status="on"
+        #     fi
+                      
+        #     # 返回正常状态
+        #     current_state="$STATE_NORMAL"
+        #     log_event "状态转换: 唤醒 -> 正常"
+        #     ;;
         "$STATE_WAKEUP")
-            # 唤醒处理状态
-            if [ "$screen_status" = "off" ]; then
-                xset dpms force on 2>/dev/null
-                log_event "屏幕控制: 点亮屏幕"
-                screen_status="on"
-            fi
-            
-            # 重置空闲时间计数
-            local reset_time=$(date +%s)
-            idle_ms=0
-            idle_sec=0
-            
-            # 检测是否为触摸唤醒（快速活动）
-            local actual_idle_ms=$(get_idle_time)
-            local actual_idle_sec=$((actual_idle_ms / 1000))
-            if [ "$actual_idle_sec" -lt 2 ]; then
-                log_event "触摸唤醒检测 - 快速活动"
-            fi
-            
-            # 返回正常状态
-            current_state="$STATE_NORMAL"
-            log_event "状态转换: 唤醒 -> 正常"
-            ;;
+        # 唤醒处理状态
+        
+        # 确保屏幕已经点亮 (双重保险)
+        if [ "$screen_status" = "off" ]; then
+            xset dpms force on 2>/dev/null
+            log_event "屏幕控制: 点亮屏幕"
+            screen_status="on"
+        fi
+          
+        # 返回正常状态
+        current_state="$STATE_NORMAL"
+        log_event "状态转换: 唤醒 -> 正常"
+        ;;
     esac
     
     # 更新运行时状态
-    write_runtime_state "$current_state" "$idle_ms" "$screen_status"
+    write_runtime_state "$current_state" "$effective_idle_ms" "$screen_status" "$recorded_last_activity"
 }
 
 # 清理函数
