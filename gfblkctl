@@ -33,11 +33,12 @@ check_core_deps() {
     local missing=()
     command -v xprintidle >/dev/null || missing+=("xprintidle")
     command -v xset >/dev/null       || missing+=("x11-xserver-utils (provides xset)")
+    command -v brightnessctl >/dev/null || missing+=("brightnessctl")
 
     if [ ${#missing[@]} -gt 0 ]; then
         echo "错误: 缺少必需的依赖包: ${missing[*]}" >&2
         echo "请运行以下命令安装:" >&2
-        echo "  sudo apt install -y xprintidle x11-xserver-utils" >&2
+        echo "  sudo apt install -y xprintidle x11-xserver-utils brightnessctl" >&2
         exit 1
     fi
     return 0

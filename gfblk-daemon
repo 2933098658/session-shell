@@ -5,6 +5,12 @@ PERSIST_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gfblk"
 RUNTIME_STATE="/tmp/gfblk_state"
 LOG_FILE="/tmp/gfblk.log"
 
+# 日志开关
+LOG_ENABLED=false
+
+# change screen : MST or GF
+SCREEN_TYPE=MST
+
 # 状态定义
 STATE_NORMAL="normal"
 STATE_OFF="screen_off"
@@ -42,13 +48,62 @@ mkdir -p /tmp
 
 # 日志函数
 log_event() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    if [ "$LOG_ENABLED" = "true" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    fi
 }
 
 # 初始化日志
 init_log() {
-    echo "=== GFBLK Daemon 启动于 $(date) ===" >> "$LOG_FILE"
-    log_event "守护进程初始化"
+    # 检查日志开关是否开启
+    if [ "$LOG_ENABLED" = "true" ]; then
+        echo "=== GFBLK Daemon 启动于 $(date) ===" >> "$LOG_FILE"
+        log_event "守护进程初始化"
+    fi
+}
+
+# 安全唤醒屏幕并恢复亮度的函数
+safe_wakeup_screen() {
+    log_event "开始唤醒屏幕"
+    
+    case "$SCREEN_TYPE" in
+        GF)
+            log_event "读取屏幕原始亮度"
+            local backlight_path="/sys/class/backlight/backlight/brightness"
+            
+            # 1. 记录当前背光值（如果文件存在）
+            local original_brightness=200 # 给个默认值，防止读取失败
+            if [ -f "$backlight_path" ]; then
+                original_brightness=$(cat "$backlight_path" 2>/dev/null || echo 200)
+            fi
+            log_event "屏幕原始亮度为：$original_brightness"
+            
+            # 2. 唤醒屏幕
+            log_event "唤醒屏幕..."
+            xset dpms force on 2>/dev/null
+            
+            # 3. 强制拉满背光，彻底唤醒背光控制器
+            log_event "拉起背光 = 255"
+            if [ -f "$backlight_path" ]; then
+                brightnessctl set 255
+                # 4. 短暂延迟，让硬件有时间响应
+                # sleep 0.5
+                # 5. 恢复到之前的亮度
+                log_event "恢复背光 = $original_brightness"
+                brightnessctl set "$original_brightness"
+            fi
+            ;;
+        MST)
+            # MST 屏幕只需要通过 xset 唤醒即可
+            log_event "唤醒屏幕..."
+            xset dpms force on 2>/dev/null
+            ;;
+        *)
+            # 未知屏幕类型的兜底处理
+            log_event "未知的屏幕类型: $SCREEN_TYPE，尝试基础唤醒..."
+            xset dpms force on 2>/dev/null
+            ;;
+    esac
 }
 
 # 加载配置
@@ -56,7 +111,7 @@ load_config() {
     enabled=$(cat "$PERSIST_DIR/enabled" 2>/dev/null || echo "false")
     timeout_raw=$(cat "$PERSIST_DIR/timeout" 2>/dev/null || echo "300")
     unit=$(cat "$PERSIST_DIR/unit" 2>/dev/null || echo "sec")
-    
+
     # 转换为秒
     case "$unit" in
         min) timeout_sec=$((timeout_raw * 60)) ;;
@@ -91,12 +146,12 @@ write_runtime_state() {
     local idle_ms="$2"
     local screen_status="$3"
     local last_activity="$4"
-    
+
     # 从持久化配置读取基础配置
     local enabled=$(cat "$PERSIST_DIR/enabled" 2>/dev/null || echo "false")
     local timeout_raw=$(cat "$PERSIST_DIR/timeout" 2>/dev/null || echo "300")
     local unit=$(cat "$PERSIST_DIR/unit" 2>/dev/null || echo "sec")
-    
+
     cat > "$RUNTIME_STATE" <<EOF
 enabled=$enabled
 timeout=$timeout_raw
@@ -107,7 +162,7 @@ state=$current_state
 screen_status=$screen_status
 EOF
 }
-
+screen_status
 # 改进的状态机 - 修复关键问题
 improved_state_machine() {
     local current_time=$(date +%s)
@@ -115,10 +170,12 @@ improved_state_machine() {
     local actual_idle_ms=$(get_idle_time)
     local actual_idle_sec=$((actual_idle_ms / 1000))
 
-    local screen_status=$(get_screen_status)
+    local new_screen_status=$(get_screen_status)
+    [ -z "$screen_status" ] && screen_status=$(get_screen_status)
+    [ -z "$current_state" ] && current_state="$STATE_NORMAL"
 
-    local current_state="$STATE_NORMAL"
     local recorded_last_activity=0
+    #log_event "读取状态表前先检查屏幕状态：$screen_status"
 
     if [ -f "$RUNTIME_STATE" ]; then
         current_state=$(grep '^state=' "$RUNTIME_STATE" 2>/dev/null | cut -d= -f2 | head -1)
@@ -126,7 +183,7 @@ improved_state_machine() {
         [ -z "$current_state" ] && current_state="$STATE_NORMAL"
         [ -z "$recorded_last_activity" ] && recorded_last_activity=$current_time
     fi
-
+        #log_event "检测输入状态前先检查屏幕状态：$screen_status"
     # 检测用户活动并重置计时器
     # 如果实际空闲时间 (actual_idle_sec) 远小于 (当前时间 - 记录的最后活动时间)
     # 说明发生了新的输入事件（触摸/鼠标/键盘），必须更新 last_activity 为当前时间
@@ -138,15 +195,17 @@ improved_state_machine() {
         # 如果之前处于息屏或唤醒状态，现在应该视为正常活跃状态
         if [ "$current_state" != "$STATE_NORMAL" ]; then
             log_event "检测到用户活动 - 重置计时器并恢复常态"
+            log_event "此时屏幕状态：screen_status=$screen_status,new_screen_status=$new_screen_status"
             # 如果屏幕是关的，先打开
-            if [ "$screen_status" = "off" ]; then
-                xset dpms force on 2>/dev/null
-                screen_status="on"
+            if [[ "$screen_status" = "off" && "$new_screen_status" = "on" ]]; then
+                log_event "开始点亮屏幕"
+                safe_wakeup_screen
+                log_event "屏幕点亮完成"
+                screen_status="$new_screen_status"
             fi
-            current_state="$STATE_NORMAL"
         else
             # 仅在日志中偶尔记录，避免刷屏，这里简化处理不记录每次微小活动
-            : 
+            :
         fi
     fi
 
@@ -156,11 +215,6 @@ improved_state_machine() {
 
     # 如果功能禁用，确保屏幕开启并重置状态
     if [ "$enabled" != "true" ]; then
-        if [ "$screen_status" = "off" ]; then
-            xset dpms force on 2>/dev/null
-            log_event "功能禁用 - 点亮屏幕"
-            screen_status="on"
-        fi
         if [ "$current_state" != "$STATE_NORMAL" ]; then
             current_state="$STATE_NORMAL"
             log_event "状态重置: 功能禁用 -> 正常状态"
@@ -169,7 +223,7 @@ improved_state_machine() {
         write_runtime_state "$current_state" "$effective_idle_ms" "$screen_status" "$recorded_last_activity"
         return
     fi
-    
+
     # 功能启用时的状态处理
     case "$current_state" in
         "$STATE_NORMAL")
@@ -186,12 +240,12 @@ improved_state_machine() {
                     DISPLAY=:0 setsid /usr/local/bin/gfblk-shield &
                     log_event "已部署潜伏盾牌 (等待首次触摸)"
                 fi
-                
+
                 # 注意：此时 recorded_last_activity 保持不变，以便唤醒时能计算出真正的空闲时长
                 log_event "状态转换: 正常 -> 息屏 (空闲${effective_idle_sec}秒)"
             fi
             ;;
-            
+
         "$STATE_OFF")
             # --- 【核心看门狗】确保盾牌持续运行 ---
             # 如果检测到没有盾牌进程在运行，立即启动一个新的
@@ -205,10 +259,10 @@ improved_state_machine() {
             if [ "$screen_status" = "on" ] || [ "$effective_idle_sec" -lt "$timeout_sec" ]; then
                 current_state="$STATE_WAKEUP"
                 log_event "状态转换: 息屏 -> 唤醒 (检测到活动)"
-                
+
                 # 确保屏幕是亮的
                 if [ "$screen_status" = "off" ]; then
-                    xset dpms force on 2>/dev/null
+                    safe_wakeup_screen
                     screen_status="on"
                 fi
             else
@@ -218,43 +272,33 @@ improved_state_machine() {
                     screen_status="off"
                 fi
             fi
-            ;;            
-        # "$STATE_WAKEUP")
-        #     # 唤醒处理状态
-        #     if [ "$screen_status" = "off" ]; then
-        #         xset dpms force on 2>/dev/null
-        #         log_event "屏幕控制: 点亮屏幕"
-        #         screen_status="on"
-        #     fi
-                      
-        #     # 返回正常状态
-        #     current_state="$STATE_NORMAL"
-        #     log_event "状态转换: 唤醒 -> 正常"
-        #     ;;
+            #log_event "正常息屏状态：screen_status=$screen_status"
+            ;;
         "$STATE_WAKEUP")
         # 唤醒处理状态
-        
+        log_event "屏幕唤醒：case ：$STATE_WAKEUP 分支"
         # 确保屏幕已经点亮 (双重保险)
         if [ "$screen_status" = "off" ]; then
-            xset dpms force on 2>/dev/null
+            safe_wakeup_screen
             log_event "屏幕控制: 点亮屏幕"
             screen_status="on"
         fi
-          
+
         # 返回正常状态
         current_state="$STATE_NORMAL"
         log_event "状态转换: 唤醒 -> 正常"
         ;;
     esac
-    
+
     # 更新运行时状态
     write_runtime_state "$current_state" "$effective_idle_ms" "$screen_status" "$recorded_last_activity"
+    #log_event "重写状态表：current_state=$current_state"
 }
 
 # 清理函数
 cleanup() {
     log_event "守护进程退出 - 清理资源"
-    xset dpms force on 2>/dev/null
+    safe_wakeup_screen
     rm -f "/tmp/gfblk_touch_eater"
     exit 0
 }
@@ -267,7 +311,7 @@ main_loop() {
     check_core_deps
     init_log
     log_event "守护进程启动"
-    
+
     load_config
 
     # 初始状态重置
@@ -281,7 +325,7 @@ idle_ms=0
 state=$STATE_NORMAL
 screen_status=$(get_screen_status)
 EOF
-    
+
     local loop_count=0
     while true; do
         # 每5次循环重新加载配置
@@ -289,7 +333,7 @@ EOF
             load_config
         fi
         ((loop_count++))
-        
+
         improved_state_machine
         sleep 1
     done
